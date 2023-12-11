@@ -1,5 +1,17 @@
 {
   "dependencies": {
+    "com.coffee.nano-monitor": {
+      "version": "file:NanoMonitor",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
+    "com.coffee.simple-scene-navigator": {
+      "version": "file:SceneNavigator",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
     "com.coffee.softmask-for-ugui": {
       "version": "file:src",
       "depth": 0,

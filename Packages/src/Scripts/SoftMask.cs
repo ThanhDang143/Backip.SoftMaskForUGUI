@@ -1,170 +1,75 @@
 ﻿using System.Collections.Generic;
+using UnityEditor;
 using UnityEngine;
 using UnityEngine.Profiling;
 using UnityEngine.Rendering;
-using UnityEngine.Serialization;
 using UnityEngine.UI;
-using Object = UnityEngine.Object;
 
 namespace Coffee.UISoftMask
 {
     /// <summary>
-    /// Soft mask.
-    /// Use instead of Mask for smooth masking.
+    /// SoftMask.
     /// </summary>
-    public class SoftMask : Mask, IMeshModifier
+    [DisallowMultipleComponent]
+    [ExecuteAlways]
+    public class SoftMask : Mask, IMeshModifier, IMaskable, IMaskingShapeContainerOwner
     {
-        /// <summary>
-        /// Down sampling rate.
-        /// </summary>
-        public enum DownSamplingRate
-        {
-            None = 0,
-            x1 = 1,
-            x2 = 2,
-            x4 = 4,
-            x8 = 8,
-        }
+        private static readonly Camera.MonoOrStereoscopicEye[] s_MonoEyes = { Camera.MonoOrStereoscopicEye.Mono };
 
-        private static readonly List<SoftMask>[] s_TmpSoftMasks = new List<SoftMask>[]
-        {
-            new List<SoftMask>(),
-            new List<SoftMask>(),
-            new List<SoftMask>(),
-            new List<SoftMask>(),
-        };
+        private static readonly Camera.MonoOrStereoscopicEye[] s_StereoEyes =
+            { Camera.MonoOrStereoscopicEye.Left, Camera.MonoOrStereoscopicEye.Right };
 
-        private static readonly Color[] s_ClearColors = new Color[]
-        {
-            new Color(0, 0, 0, 0),
-            new Color(1, 0, 0, 0),
-            new Color(1, 1, 0, 0),
-            new Color(1, 1, 1, 0),
-        };
+        [Tooltip("Enable alpha hit test.")]
+        [SerializeField]
+        public bool m_AlphaHitTest;
 
-        private static bool s_UVStartsAtTop;
-        private static bool s_IsMetal;
-        private static Shader s_SoftMaskShader;
-        private static Texture2D s_ReadTexture;
-        private static readonly List<SoftMask> s_ActiveSoftMasks = new List<SoftMask>();
-        private static readonly List<SoftMask> s_TempRelatables = new List<SoftMask>();
-        private static readonly Dictionary<int, Matrix4x4> s_PreviousViewProjectionMatrices = new Dictionary<int, Matrix4x4>();
-        private static readonly Dictionary<int, Matrix4x4> s_NowViewProjectionMatrices = new Dictionary<int, Matrix4x4>();
-        private static int s_StencilCompId;
-        private static int s_ColorMaskId;
-        private static int s_MainTexId;
-        private static int s_SoftnessId;
-        private static int s_Alpha;
-        private static int s_PreviousWidth;
-        private static int s_PreviousHeight;
-        private MaterialPropertyBlock _mpb;
+        [Tooltip("The threshold for soft masking.")]
+        [SerializeField]
+        public MinMax01 m_Threshold = new MinMax01(0, 1f);
+
+        private readonly List<SoftMask> _children = new List<SoftMask>();
+
         private CommandBuffer _cb;
-        private Material _material;
-        private RenderTexture _softMaskBuffer;
-        private int _stencilDepth;
+        private bool _hasSoftMaskBufferDrawn;
         private Mesh _mesh;
+        private MaterialPropertyBlock _mpb;
         private SoftMask _parent;
-        internal readonly List<SoftMask> _children = new List<SoftMask>();
-        private bool _hasChanged = false;
-        private bool _hasStencilStateChanged = false;
-
-
-        [FormerlySerializedAs("m_DesamplingRate")] [SerializeField, Tooltip("The down sampling rate for soft mask buffer.")]
-        private DownSamplingRate m_DownSamplingRate = DownSamplingRate.x1;
-
-        [SerializeField, Range(0, 1), Tooltip("The value used by the soft mask to select the area of influence defined over the soft mask's graphic.")]
-        private float m_Softness = 1;
-
-        [SerializeField, Range(0f, 1f), Tooltip("The transparency of the whole masked graphic.")]
-        private float m_Alpha = 1;
-
-        [Header("Advanced Options")] [SerializeField, Tooltip("Should the soft mask ignore parent soft masks?")]
-        private bool m_IgnoreParent = false;
-
-        [SerializeField, Tooltip("Is the soft mask a part of parent soft mask?")]
-        private bool m_PartOfParent = false;
-
-        [SerializeField, Tooltip("Self graphic will not be drawn to soft mask buffer.")]
-        private bool m_IgnoreSelfGraphic;
-
-
-        [SerializeField, Tooltip("Self graphic will not be written to stencil buffer.")]
-        private bool m_IgnoreSelfStencil;
+        private Matrix4x4 _prevTransformMatrix;
+        private Canvas _rootCanvas;
+        private MaskingShapeContainer _shapeContainer;
+        internal RenderTexture _softMaskBuffer;
+        private CanvasViewChangeTrigger _viewChangeTrigger;
 
         /// <summary>
-        /// The down sampling rate for soft mask buffer.
+        /// Enable alpha hit test.
         /// </summary>
-        public DownSamplingRate downSamplingRate
+        public bool alphaHitTest
         {
-            get { return m_DownSamplingRate; }
-            set
-            {
-                if (m_DownSamplingRate == value) return;
-                m_DownSamplingRate = value;
-                hasChanged = true;
-            }
+            get => m_AlphaHitTest;
+            set => m_AlphaHitTest = value;
         }
 
         /// <summary>
-        /// The value used by the soft mask to select the area of influence defined over the soft mask's graphic.
+        /// The soft mask depth.
         /// </summary>
-        public float softness
+        public int softMaskDepth
         {
-            get { return m_Softness; }
-            set
+            get
             {
-                value = Mathf.Clamp01(value);
-                if (Mathf.Approximately(m_Softness, value)) return;
-                m_Softness = value;
-                hasChanged = true;
+                var depth = -1;
+                for (var current = this; current; current = current._parent)
+                {
+                    if (current.MaskEnabled())
+                    {
+                        depth++;
+                    }
+                }
+
+                return depth;
             }
         }
 
-        /// <summary>
-        /// The transparency of the whole masked graphic.
-        /// </summary>
-        public float alpha
-        {
-            get { return m_Alpha; }
-            set
-            {
-                value = Mathf.Clamp01(value);
-                if (Mathf.Approximately(m_Alpha, value)) return;
-                m_Alpha = value;
-                hasChanged = true;
-            }
-        }
-
-        /// <summary>
-        /// Should the soft mask ignore parent soft masks?
-        /// </summary>
-        /// <value>If set to true the soft mask will ignore any parent soft mask settings.</value>
-        public bool ignoreParent
-        {
-            get { return m_IgnoreParent; }
-            set
-            {
-                if (m_IgnoreParent == value) return;
-                m_IgnoreParent = value;
-                hasChanged = true;
-                OnTransformParentChanged();
-            }
-        }
-
-        /// <summary>
-        /// Is the soft mask a part of parent soft mask?
-        /// </summary>
-        public bool partOfParent
-        {
-            get { return m_PartOfParent; }
-            set
-            {
-                if (m_PartOfParent == value) return;
-                m_PartOfParent = value;
-                hasChanged = true;
-                OnTransformParentChanged();
-            }
-        }
+        public bool hasSoftMaskBuffer => _softMaskBuffer;
 
         /// <summary>
         /// The soft mask buffer.
@@ -173,615 +78,469 @@ namespace Coffee.UISoftMask
         {
             get
             {
-                if (_parent)
+                if (UISoftMaskProjectSettings.softMaskEnabled && MaskEnabled())
                 {
-                    ReleaseRt(ref _softMaskBuffer);
-                    return _parent.softMaskBuffer;
+                    var id = GetInstanceID();
+                    var size = RenderTextureRepository.GetScreenSize();
+                    var rate = (int)UISoftMaskProjectSettings.downSamplingRate;
+                    return RenderTextureRepository.Get(id, size, rate, ref _softMaskBuffer, false);
                 }
 
-                // Check the size of soft mask buffer.
-                int w, h;
-                GetDownSamplingSize(m_DownSamplingRate, out w, out h);
-                if (_softMaskBuffer && (_softMaskBuffer.width != w || _softMaskBuffer.height != h))
-                {
-                    ReleaseRt(ref _softMaskBuffer);
-                }
-
-                if (!_softMaskBuffer)
-                {
-                    _softMaskBuffer = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Default, 1, RenderTextureMemoryless.Depth);
-                    hasChanged = true;
-                    _hasStencilStateChanged = true;
-                }
-
-                return _softMaskBuffer;
+                RenderTextureRepository.Release(ref _softMaskBuffer);
+                return null;
             }
         }
-
-        public bool hasChanged
-        {
-            get { return _parent ? _parent.hasChanged : _hasChanged; }
-            private set
-            {
-                if (_parent)
-                {
-                    _parent.hasChanged = value;
-                }
-
-                _hasChanged = value;
-            }
-        }
-
-        public SoftMask parent
-        {
-            get { return _parent; }
-        }
-
-        public bool ignoreSelfGraphic
-        {
-            get { return m_IgnoreSelfGraphic; }
-            set
-            {
-                if (m_IgnoreSelfGraphic == value) return;
-                m_IgnoreSelfGraphic = value;
-                hasChanged = true;
-                graphic.SetVerticesDirtyEx();
-            }
-        }
-
-        public bool ignoreSelfStencil
-        {
-            get { return m_IgnoreSelfStencil; }
-            set
-            {
-                if (m_IgnoreSelfStencil == value) return;
-                m_IgnoreSelfStencil = value;
-                hasChanged = true;
-                graphic.SetVerticesDirtyEx();
-                graphic.SetMaterialDirtyEx();
-            }
-        }
-
-
-        Material material
-        {
-            get
-            {
-                return _material
-                    ? _material
-                    : _material =
-                        new Material(s_SoftMaskShader
-                            ? s_SoftMaskShader
-                            : s_SoftMaskShader = Resources.Load<Shader>("SoftMask")) {hideFlags = HideFlags.HideAndDontSave};
-            }
-        }
-
-        Mesh mesh
-        {
-            get { return _mesh ? _mesh : _mesh = new Mesh() {hideFlags = HideFlags.HideAndDontSave}; }
-        }
-
 
         /// <summary>
-        /// Perform material modification in this function.
+        /// The threshold for soft masking.
         /// </summary>
-        /// <returns>Modified material.</returns>
-        /// <param name="baseMaterial">Configured Material.</param>
-        public override Material GetModifiedMaterial(Material baseMaterial)
+        public MinMax01 threshold
         {
-            hasChanged = true;
-            if (ignoreSelfStencil) return baseMaterial;
-
-            var result = base.GetModifiedMaterial(baseMaterial);
-            if (m_IgnoreParent && result != baseMaterial)
+            get => m_Threshold;
+            set
             {
-                result.SetInt(s_StencilCompId, (int) CompareFunction.Always);
-            }
+                if (m_Threshold.Approximately(value)) return;
 
-            return result;
+                m_Threshold = value;
+                SetSoftMaskDirty();
+            }
         }
 
+        /// <summary>
+        /// Clear color for the soft mask buffer.
+        /// </summary>
+        public Color clearColor
+        {
+            get;
+            set;
+        }
+
+        public bool isDirty
+        {
+            get;
+            private set;
+        }
 
         /// <summary>
-        /// Call used to modify mesh.
+        /// Called when the component is enabled.
         /// </summary>
+        protected override void OnEnable()
+        {
+            UIExtraCallbacks.onBeforeCanvasRebuild += CheckTransformChanged;
+            UIExtraCallbacks.onAfterCanvasRebuild += RenderSoftMaskBuffer;
+            SoftMaskUtils.onChangeBufferSize += SetDirtyAndNotify;
+
+            if (graphic)
+            {
+                graphic.RegisterDirtyMaterialCallback(UpdateParentSoftMask);
+                graphic.RegisterDirtyVerticesCallback(SetSoftMaskDirty);
+                graphic.SetVerticesDirty();
+            }
+
+            if (UISoftMaskProjectSettings.softMaskableBehavior == SoftMaskableBehavior.Automatic)
+            {
+                this.AddComponentOnChildren<SoftMaskable>(UISoftMaskProjectSettings.behaviorHideFlags, true);
+            }
+
+            OnCanvasHierarchyChanged();
+            _shapeContainer = GetComponent<MaskingShapeContainer>();
+
+            base.OnEnable();
+        }
+
+        /// <summary>
+        /// Called when the component is disabled.
+        /// </summary>
+        protected override void OnDisable()
+        {
+            UIExtraCallbacks.onBeforeCanvasRebuild -= CheckTransformChanged;
+            UIExtraCallbacks.onAfterCanvasRebuild -= RenderSoftMaskBuffer;
+            SoftMaskUtils.onChangeBufferSize -= SetDirtyAndNotify;
+
+            if (graphic)
+            {
+                graphic.UnregisterDirtyMaterialCallback(UpdateParentSoftMask);
+                graphic.UnregisterDirtyVerticesCallback(SetSoftMaskDirty);
+                graphic.SetVerticesDirty();
+            }
+
+            UpdateParentSoftMask(null);
+            _children.Clear();
+
+            SoftMaskUtils.meshPool.Return(ref _mesh);
+            SoftMaskUtils.materialPropertyBlockPool.Return(ref _mpb);
+            SoftMaskUtils.commandBufferPool.Return(ref _cb);
+            RenderTextureRepository.Release(ref _softMaskBuffer);
+
+            UpdateCanvasViewChangeTrigger(null);
+            _rootCanvas = null;
+            _shapeContainer = null;
+
+            base.OnDisable();
+        }
+
+        /// <summary>
+        /// Called when the state of the parent Canvas is changed.
+        /// </summary>
+        protected override void OnCanvasHierarchyChanged()
+        {
+            if (!isActiveAndEnabled) return;
+            _rootCanvas = this.GetRootComponent<Canvas>();
+            UpdateCanvasViewChangeTrigger(null);
+        }
+
+        /// <summary>
+        /// Call from unity if animation properties have changed.
+        /// </summary>
+        protected override void OnDidApplyAnimationProperties()
+        {
+            SetSoftMaskDirty();
+        }
+
+        /// <summary>
+        /// This callback is called if an associated RectTransform has its dimensions changed. The call is also made to all child
+        /// rect transforms, even if the child transform itself doesn't change - as it could have, depending on its anchoring.
+        /// </summary>
+        protected override void OnRectTransformDimensionsChange()
+        {
+            SetSoftMaskDirty();
+        }
+
+        protected void OnTransformChildrenChanged()
+        {
+            if (!isActiveAndEnabled) return;
+            if (UISoftMaskProjectSettings.softMaskableBehavior == SoftMaskableBehavior.Automatic)
+            {
+                this.AddComponentOnChildren<SoftMaskable>(UISoftMaskProjectSettings.behaviorHideFlags, false);
+            }
+        }
+
+        protected override void OnTransformParentChanged()
+        {
+            UpdateParentSoftMask();
+            UpdateCanvasViewChangeTrigger(CanvasViewChangeTrigger.Find(transform));
+        }
+
+#if UNITY_EDITOR
+        protected override void OnValidate()
+        {
+            base.OnValidate();
+            SetSoftMaskDirty();
+        }
+#endif
+
+        void IMaskable.RecalculateMasking()
+        {
+            SetSoftMaskDirty();
+            if (!UISoftMaskProjectSettings.softMaskEnabled && _softMaskBuffer)
+            {
+                RenderTextureRepository.Release(ref _softMaskBuffer);
+            }
+        }
+
+        void IMaskingShapeContainerOwner.Register(MaskingShapeContainer container)
+        {
+            _shapeContainer = container;
+        }
+
         void IMeshModifier.ModifyMesh(Mesh mesh)
         {
-            hasChanged = true;
-            _mesh = mesh;
         }
 
-        /// <summary>
-        /// Call used to modify mesh.
-        /// </summary>
         void IMeshModifier.ModifyMesh(VertexHelper verts)
         {
-            if (isActiveAndEnabled)
+            if (!MaskEnabled()) return;
+
+            Profiler.BeginSample("(SM4UI)[SoftMask] ModifyMesh");
+            if (!_mesh)
             {
-                if (ignoreSelfGraphic)
+                _mesh = SoftMaskUtils.meshPool.Rent();
+            }
+
+            verts.FillMesh(_mesh);
+            _mesh.RecalculateBounds();
+
+            Profiler.EndSample();
+
+            Logging.Log(this, " >>>> Graphic mesh is modified.");
+        }
+
+        private void CheckTransformChanged()
+        {
+            if (transform.HasChanged(ref _prevTransformMatrix))
+            {
+                SetSoftMaskDirty();
+            }
+
+            if (!_viewChangeTrigger && _rootCanvas && _rootCanvas.renderMode == RenderMode.WorldSpace)
+            {
+                UpdateCanvasViewChangeTrigger(CanvasViewChangeTrigger.Find(transform));
+                SetSoftMaskDirty();
+            }
+        }
+
+        private void UpdateCanvasViewChangeTrigger(CanvasViewChangeTrigger trigger)
+        {
+            if (_viewChangeTrigger != trigger)
+            {
+                Logging.Log(this, $"UpdateCanvasViewChangeTrigger: {_viewChangeTrigger} -> {trigger}");
+
+                if (_viewChangeTrigger)
                 {
-                    verts.Clear();
-                    verts.FillMesh(mesh);
+                    _viewChangeTrigger.onViewChange -= SetSoftMaskDirty;
                 }
-                else if (ignoreSelfStencil)
+
+                if (trigger)
                 {
-                    verts.FillMesh(mesh);
-                    verts.Clear();
-                }
-                else
-                {
-                    verts.FillMesh(mesh);
+                    trigger.onViewChange += SetSoftMaskDirty;
                 }
             }
 
-            hasChanged = true;
-        }
-
-        /// <summary>
-        /// Given a point and a camera is the raycast valid.
-        /// </summary>
-        /// <returns>Valid.</returns>
-        /// <param name="sp">Screen position.</param>
-        /// <param name="eventCamera">Raycast camera.</param>
-        /// <param name="g">Target graphic.</param>
-        public bool IsRaycastLocationValid(Vector2 sp, Camera eventCamera, Graphic g, int[] interactions)
-        {
-            if (!isActiveAndEnabled || (g == graphic && !g.raycastTarget)) return true;
-
-            int x = (int) ((softMaskBuffer.width - 1) * Mathf.Clamp01(sp.x / Screen.width));
-            int y = s_UVStartsAtTop && !s_IsMetal
-                ? (int) ((softMaskBuffer.height - 1) * (1 - Mathf.Clamp01(sp.y / Screen.height)))
-                : (int) ((softMaskBuffer.height - 1) * Mathf.Clamp01(sp.y / Screen.height));
-            return 0.5f < GetPixelValue(x, y, interactions);
+            _viewChangeTrigger = trigger;
         }
 
         public override bool IsRaycastLocationValid(Vector2 sp, Camera eventCamera)
         {
-            return true;
-        }
-
-        /// <summary>
-        /// This function is called when the object becomes enabled and active.
-        /// </summary>
-        protected override void OnEnable()
-        {
-            hasChanged = true;
-
-            // Register.
-            if (s_ActiveSoftMasks.Count == 0)
+            if (FrameCache.TryGet(this, nameof(IsRaycastLocationValid), out bool valid))
             {
-                Canvas.willRenderCanvases += UpdateMaskTextures;
-
-                if (s_StencilCompId == 0)
-                {
-                    s_UVStartsAtTop = SystemInfo.graphicsUVStartsAtTop;
-                    s_IsMetal = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Metal;
-                    s_StencilCompId = Shader.PropertyToID("_StencilComp");
-                    s_ColorMaskId = Shader.PropertyToID("_ColorMask");
-                    s_MainTexId = Shader.PropertyToID("_MainTex");
-                    s_SoftnessId = Shader.PropertyToID("_Softness");
-                    s_Alpha = Shader.PropertyToID("_Alpha");
-                }
+                return valid;
             }
 
-            s_ActiveSoftMasks.Add(this);
-
-            // Reset the parent-child relation.
-            GetComponentsInChildren<SoftMask>(false, s_TempRelatables);
-            for (int i = s_TempRelatables.Count - 1; 0 <= i; i--)
+            if (!isActiveAndEnabled)
             {
-                s_TempRelatables[i].OnTransformParentChanged();
+                FrameCache.Set(this, nameof(IsRaycastLocationValid), true);
+                return true;
             }
 
-            s_TempRelatables.Clear();
-
-            // Create objects.
-            _mpb = new MaterialPropertyBlock();
-            _cb = new CommandBuffer();
-
-            graphic.SetVerticesDirtyEx();
-
-            base.OnEnable();
-            _hasStencilStateChanged = false;
-        }
-
-        /// <summary>
-        /// This function is called when the behaviour becomes disabled.
-        /// </summary>
-        protected override void OnDisable()
-        {
-            // Unregister.
-            s_ActiveSoftMasks.Remove(this);
-            if (s_ActiveSoftMasks.Count == 0)
+            // Check parent
+            if (_parent && !_parent.IsRaycastLocationValid(sp, eventCamera))
             {
-                Canvas.willRenderCanvases -= UpdateMaskTextures;
+                FrameCache.Set(this, nameof(IsRaycastLocationValid), false);
+                return false;
             }
 
-            // Reset the parent-child relation.
-            for (int i = _children.Count - 1; 0 <= i; i--)
+            Profiler.BeginSample("(SM4UI)[SoftMask] IsRaycastLocationValid > Base");
+            valid = base.IsRaycastLocationValid(sp, eventCamera);
+            Profiler.EndSample();
+
+            if (!MaskEnabled() || !UISoftMaskProjectSettings.softMaskEnabled)
             {
-                _children[i].SetParent(_parent);
+                FrameCache.Set(this, nameof(IsRaycastLocationValid), valid);
+                return valid;
             }
 
-            _children.Clear();
-            SetParent(null);
-
-            // Destroy objects.
-            _mpb.Clear();
-            _mpb = null;
-            _cb.Release();
-            _cb = null;
-
-            ReleaseObject(_mesh);
-            _mesh = null;
-            ReleaseObject(_material);
-            _material = null;
-            ReleaseRt(ref _softMaskBuffer);
-
-            base.OnDisable();
-            _hasStencilStateChanged = false;
-        }
-
-        /// <summary>
-        /// This function is called when the parent property of the transform of the GameObject has changed.
-        /// </summary>
-        protected override void OnTransformParentChanged()
-        {
-            hasChanged = true;
-            SoftMask newParent = null;
-            if (isActiveAndEnabled && !m_IgnoreParent)
+            if (valid && alphaHitTest)
             {
-                var parentTransform = transform.parent;
-                while (parentTransform && (!newParent || !newParent.enabled))
-                {
-                    newParent = parentTransform.GetComponent<SoftMask>();
-                    parentTransform = parentTransform.parent;
-                }
-            }
-
-            SetParent(newParent);
-            hasChanged = true;
-        }
-
-        protected override void OnRectTransformDimensionsChange()
-        {
-            hasChanged = true;
-        }
-
-#if UNITY_EDITOR
-        /// <summary>
-        /// This function is called when the script is loaded or a value is changed in the inspector (Called in the editor only).
-        /// </summary>
-        protected override void OnValidate()
-        {
-            graphic.SetVerticesDirtyEx();
-            graphic.SetMaterialDirtyEx();
-            OnTransformParentChanged();
-            base.OnValidate();
-            _hasStencilStateChanged = false;
-        }
-#endif
-
-        /// <summary>
-        /// Update all soft mask textures.
-        /// </summary>
-        private static void UpdateMaskTextures()
-        {
-            Profiler.BeginSample("UpdateMaskTextures");
-            foreach (var sm in s_ActiveSoftMasks)
-            {
-                if (!sm || sm._hasChanged)
-                    continue;
-
-                var canvas = sm.graphic.canvas;
-                if (!canvas)
-                    continue;
-
-                if (canvas.renderMode == RenderMode.WorldSpace)
-                {
-                    var cam = canvas.worldCamera;
-                    if (!cam)
-                        continue;
-
-                    Profiler.BeginSample("Check view projection matrix changed (world space)");
-                    var nowVP = cam.projectionMatrix * cam.worldToCameraMatrix;
-                    var previousVP = default(Matrix4x4);
-                    var id = cam.GetInstanceID();
-                    s_PreviousViewProjectionMatrices.TryGetValue(id, out previousVP);
-                    s_NowViewProjectionMatrices[id] = nowVP;
-
-                    if (previousVP != nowVP)
-                    {
-                        sm.hasChanged = true;
-                    }
-
-                    Profiler.EndSample();
-                }
-
-                var rt = sm.rectTransform;
-                if (rt.hasChanged)
-                {
-                    rt.hasChanged = false;
-                    sm.hasChanged = true;
-                }
-#if UNITY_EDITOR
-                if (!Application.isPlaying)
-                {
-                    sm.hasChanged = true;
-                }
-#endif
-            }
-
-            Profiler.BeginSample("Update changed soft masks");
-            foreach (var sm in s_ActiveSoftMasks)
-            {
-                if (!sm || !sm._hasChanged)
-                    continue;
-
-                sm._hasChanged = false;
-                if (sm._parent) continue;
-                sm.UpdateMaskTexture();
-
-                if (!sm._hasStencilStateChanged) continue;
-                sm._hasStencilStateChanged = false;
-
-                Profiler.BeginSample("Notify stencil state changed");
-                MaskUtilities.NotifyStencilStateChanged(sm);
+                Profiler.BeginSample("(SM4UI)[SoftMask] IsRaycastLocationValid > Alpha hit test");
+                valid = Utils.AlphaHitTestValid(graphic, sp, eventCamera, 0.01f);
                 Profiler.EndSample();
             }
 
-            Profiler.EndSample();
-
-            Profiler.BeginSample("Update previous view projection matrices");
-            s_PreviousViewProjectionMatrices.Clear();
-            foreach (var kv in s_NowViewProjectionMatrices)
+            if (_shapeContainer)
             {
-                s_PreviousViewProjectionMatrices.Add(kv.Key, kv.Value);
+                Profiler.BeginSample("(SM4UI)[SoftMask] IsRaycastLocationValid > Shapes");
+                valid |= _shapeContainer.IsInside(sp, eventCamera, false, 0.5f);
+                Profiler.EndSample();
             }
 
-            s_NowViewProjectionMatrices.Clear();
-            Profiler.EndSample();
-
-            Profiler.EndSample();
-
-#if UNITY_EDITOR
-            var w = s_PreviousWidth;
-            var h = s_PreviousHeight;
-            GetDownSamplingSize(DownSamplingRate.None, out s_PreviousWidth, out  s_PreviousHeight);
-            if (w != s_PreviousWidth || h != s_PreviousHeight)
-            {
-                Canvas.ForceUpdateCanvases();
-            }
-#endif
+            FrameCache.Set(this, nameof(IsRaycastLocationValid), valid);
+            return valid;
         }
 
-        /// <summary>
-        /// Update the mask texture.
-        /// </summary>
-        private void UpdateMaskTexture()
+        public override Material GetModifiedMaterial(Material baseMaterial)
         {
-            if (!graphic || !graphic.canvas) return;
-            Profiler.BeginSample("UpdateMaskTexture");
-
-
-            _stencilDepth = MaskUtilities.GetStencilDepth(transform, MaskUtilities.FindRootSortOverrideCanvas(transform));
-
-            // Collect children soft masks.
-            Profiler.BeginSample("Collect children soft masks");
-            var depth = 0;
-            s_TmpSoftMasks[0].Add(this);
-            while (_stencilDepth + depth < 3)
+            if (UISoftMaskProjectSettings.softMaskEnabled && MaskEnabled())
             {
-                var count = s_TmpSoftMasks[depth].Count;
-                for (var i = 0; i < count; i++)
-                {
-                    var children = s_TmpSoftMasks[depth][i]._children;
-                    var childCount = children.Count;
-                    for (var j = 0; j < childCount; j++)
-                    {
-                        var child = children[j];
-                        var childDepth = child.m_PartOfParent ? depth : depth + 1;
-                        s_TmpSoftMasks[childDepth].Add(child);
-                    }
-                }
-
-                depth++;
+                return showMaskGraphic ? baseMaterial : null;
             }
 
-            Profiler.EndSample();
-
-            // CommandBuffer.
-            Profiler.BeginSample("Initialize CommandBuffer");
-            _cb.Clear();
-            _cb.SetRenderTarget(softMaskBuffer);
-            _cb.ClearRenderTarget(false, true, s_ClearColors[_stencilDepth]);
-            Profiler.EndSample();
-
-            // Set view and projection matrices.
-            Profiler.BeginSample("Set view and projection matrices");
-            var c = graphic.canvas.rootCanvas;
-            var cam = c.worldCamera ?? Camera.main;
-            if (c && c.renderMode != RenderMode.ScreenSpaceOverlay && cam)
-            {
-                var p = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false);
-                _cb.SetViewProjectionMatrices(cam.worldToCameraMatrix, p);
-            }
-            else
-            {
-                var pos = c.transform.position;
-                var vm = Matrix4x4.TRS(new Vector3(-pos.x, -pos.y, -1000), Quaternion.identity, new Vector3(1, 1, -1f));
-                var pm = Matrix4x4.TRS(new Vector3(0, 0, -1), Quaternion.identity, new Vector3(1 / pos.x, 1 / pos.y, -2 / 10000f));
-                _cb.SetViewProjectionMatrices(vm, pm);
-            }
-
-            Profiler.EndSample();
-
-            // Draw soft masks.
-            Profiler.BeginSample("Draw Mesh");
-            for (var i = 0; i < s_TmpSoftMasks.Length; i++)
-            {
-                var count = s_TmpSoftMasks[i].Count;
-                for (var j = 0; j < count; j++)
-                {
-                    var sm = s_TmpSoftMasks[i][j];
-
-                    if (i != 0)
-                    {
-                        sm._stencilDepth = MaskUtilities.GetStencilDepth(sm.transform, MaskUtilities.FindRootSortOverrideCanvas(sm.transform));
-                    }
-
-                    // Set material property.
-                    sm.material.SetInt(s_ColorMaskId, (int) 1 << (3 - _stencilDepth - i));
-                    sm._mpb.SetTexture(s_MainTexId, sm.graphic.mainTexture);
-                    sm._mpb.SetFloat(s_SoftnessId, sm.m_Softness);
-                    sm._mpb.SetFloat(s_Alpha, sm.m_Alpha);
-
-                    // Draw mesh.
-                    _cb.DrawMesh(sm.mesh, sm.transform.localToWorldMatrix, sm.material, 0, 0, sm._mpb);
-                }
-
-                s_TmpSoftMasks[i].Clear();
-            }
-
-            Profiler.EndSample();
-
-            Graphics.ExecuteCommandBuffer(_cb);
-            Profiler.EndSample();
+            return base.GetModifiedMaterial(baseMaterial);
         }
 
-        /// <summary>
-        /// Gets the size of the down sampling.
-        /// </summary>
-        private static void GetDownSamplingSize(DownSamplingRate rate, out int w, out int h)
+        private void SetDirtyAndNotify()
         {
-#if UNITY_EDITOR
-            if (!Application.isPlaying)
+            SetSoftMaskDirty();
+            MaskUtilities.NotifyStencilStateChanged(this);
+        }
+
+        public void SetSoftMaskDirty()
+        {
+            if (isDirty) return;
+
+            Logging.LogIf(!isDirty, this, $"! SetSoftMaskDirty {GetInstanceID()}");
+            isDirty = true;
+            for (var i = _children.Count - 1; i >= 0; i--)
             {
-                var res = UnityEditor.UnityStats.screenRes.Split('x');
-                w = Mathf.Max(64, int.Parse(res[0]));
-                h = Mathf.Max(64, int.Parse(res[1]));
+                if (_children[i])
+                {
+                    _children[i].SetSoftMaskDirty();
+                }
+                else
+                {
+                    _children.RemoveAt(i);
+                }
+            }
+        }
+
+        private void UpdateParentSoftMask()
+        {
+            if (MaskEnabled())
+            {
+                var stopAfter = MaskUtilities.FindRootSortOverrideCanvas(transform);
+                var parentSoftMask = transform.GetComponentInParent<SoftMask>(false, stopAfter, x => x.MaskEnabled());
+                UpdateParentSoftMask(parentSoftMask);
             }
             else
-#endif
-            if (Screen.fullScreenMode == FullScreenMode.Windowed)
             {
-                w = Screen.width;
-                h = Screen.height;
+                UpdateParentSoftMask(null);
             }
-            else
+        }
+
+        private void UpdateParentSoftMask(SoftMask newParent)
+        {
+            if (_parent && _parent._children.Contains(this))
             {
-                w = Screen.currentResolution.width;
-                h = Screen.currentResolution.height;
+                _parent._children.Remove(this);
             }
 
-            if (rate == DownSamplingRate.None)
+            if (newParent && !newParent._children.Contains(this))
+            {
+                newParent._children.Add(this);
+            }
+
+            if (_parent != newParent)
+            {
+                SetSoftMaskDirty();
+            }
+
+            _parent = newParent;
+        }
+
+        private bool InScreen()
+        {
+            if (graphic && graphic.IsInScreen()) return true;
+            if (_shapeContainer && _shapeContainer.InScreen()) return true;
+
+            return false;
+        }
+
+        private void RenderSoftMaskBuffer()
+        {
+            if (!UISoftMaskProjectSettings.softMaskEnabled) return;
+
+            if (FrameCache.TryGet(this, nameof(RenderSoftMaskBuffer), out bool _)) return;
+            FrameCache.Set(this, nameof(RenderSoftMaskBuffer), true);
+
+            if (!isDirty) return;
+            isDirty = false;
+
+            if (_parent)
+            {
+                _parent.RenderSoftMaskBuffer();
+            }
+
+            var depth = softMaskDepth;
+            if (depth < 0 || 4 <= depth) return;
+
+            if (_cb == null)
+            {
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Rent cb");
+                _cb = SoftMaskUtils.commandBufferPool.Rent();
+                _cb.name = "[SoftMask] SoftMaskBuffer";
+                Profiler.EndSample();
+            }
+
+            if (_mpb == null)
+            {
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Rent mpb");
+                _mpb = SoftMaskUtils.materialPropertyBlockPool.Rent();
+                _mpb.Clear();
+                Profiler.EndSample();
+            }
+
+            if (!InScreen())
+            {
+                if (_hasSoftMaskBufferDrawn)
+                {
+                    Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Clear");
+                    SoftMaskUtils.InitCommandBuffer(_cb, softMaskDepth, softMaskBuffer, clearColor);
+                    Graphics.ExecuteCommandBuffer(_cb);
+                    Profiler.EndSample();
+                }
+
+                _hasSoftMaskBufferDrawn = false;
                 return;
-
-            var aspect = (float) w / h;
-            if (w < h)
-            {
-                h = Mathf.ClosestPowerOfTwo(h / (int) rate);
-                w = Mathf.CeilToInt(h * aspect);
             }
-            else
+
             {
-                w = Mathf.ClosestPowerOfTwo(w / (int) rate);
-                h = Mathf.CeilToInt(w / aspect);
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Init command buffer");
+                SoftMaskUtils.InitCommandBuffer(_cb, softMaskDepth, softMaskBuffer, clearColor);
+                Profiler.EndSample();
             }
-        }
 
-        /// <summary>
-        /// Release the specified obj.
-        /// </summary>
-        /// <param name="tmpRT">Object.</param>
-        private static void ReleaseRt(ref RenderTexture tmpRT)
-        {
-            if (!tmpRT) return;
+            var eyes = SoftMaskUtils.IsStereoCanvas(graphic.canvas) ? s_StereoEyes : s_MonoEyes;
+            for (var i = 0; i < eyes.Length; i++)
+            {
+                RenderSoftMaskBuffer(eyes[i]);
+            }
 
-            tmpRT.Release();
-            RenderTexture.ReleaseTemporary(tmpRT);
-            tmpRT = null;
-        }
-
-        /// <summary>
-        /// Release the specified obj.
-        /// </summary>
-        /// <param name="obj">Object.</param>
-        private static void ReleaseObject(Object obj)
-        {
-            if (!obj) return;
+            {
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Execute command buffer");
+                Graphics.ExecuteCommandBuffer(_cb);
+                _hasSoftMaskBufferDrawn = true;
+                Logging.Log(this, $" >>>> SoftMaskBuffer '{softMaskBuffer.name}' will render.");
+                Profiler.EndSample();
+            }
 
 #if UNITY_EDITOR
             if (!Application.isPlaying)
-                DestroyImmediate(obj);
-            else
+            {
+                EditorApplication.QueuePlayerLoopUpdate();
+            }
 #endif
-                Destroy(obj);
         }
 
-
-        /// <summary>
-        /// Set the parent of the soft mask.
-        /// </summary>
-        /// <param name="newParent">The parent soft mask to use.</param>
-        private void SetParent(SoftMask newParent)
+        private void RenderSoftMaskBuffer(Camera.MonoOrStereoscopicEye eye)
         {
-            if (_parent != newParent && this != newParent)
             {
-                if (_parent && _parent._children.Contains(this))
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Set vp matrices");
+                SoftMaskUtils.SetVpMatricesCommandBuffer(eye, _cb, graphic.canvas);
+                SoftMaskUtils.ApplyMaterialPropertyBlock(_mpb, softMaskDepth, graphic.mainTexture, m_Threshold);
+                Profiler.EndSample();
+            }
+
+            if (eye != Camera.MonoOrStereoscopicEye.Right && _parent)
+            {
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Copy texture from parent");
+                if (_parent.softMaskBuffer)
                 {
-                    _parent._children.Remove(this);
-                    _parent._children.RemoveAll(x => x == null);
+                    _cb.CopyTexture(_parent.softMaskBuffer, softMaskBuffer);
                 }
 
-                _parent = newParent;
+                Profiler.EndSample();
             }
 
-            if (_parent && !_parent._children.Contains(this))
+            if (eye != Camera.MonoOrStereoscopicEye.Mono)
             {
-                _parent._children.Add(this);
-            }
-        }
-
-        /// <summary>
-        /// Gets the pixel value.
-        /// </summary>
-        private float GetPixelValue(int x, int y, int[] interactions)
-        {
-            if (!s_ReadTexture)
-            {
-                s_ReadTexture = new Texture2D(1, 1, TextureFormat.ARGB32, false);
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Set viewport");
+                var w = softMaskBuffer.width * 0.5f;
+                var h = softMaskBuffer.height;
+                _cb.SetViewport(new Rect(w * (int)eye, 0f, w, h));
+                Profiler.EndSample();
             }
 
-            var currentRt = RenderTexture.active;
-
-            RenderTexture.active = softMaskBuffer;
-            s_ReadTexture.ReadPixels(new Rect(x, y, 1, 1), 0, 0);
-            s_ReadTexture.Apply(false, false);
-            RenderTexture.active = currentRt;
-
-            var colors = s_ReadTexture.GetRawTextureData();
-
-            for (int i = 0; i < 4; i++)
             {
-                switch (interactions[(i + 3) % 4])
-                {
-                    case 0:
-                        colors[i] = 255;
-                        break;
-                    case 2:
-                        colors[i] = (byte) (255 - colors[i]);
-                        break;
-                }
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Draw mesh");
+                var softMaterial = SoftMaskUtils.GetSoftMaskingMaterial(MaskingShape.MaskingMethod.Additive);
+                _cb.DrawMesh(_mesh, transform.localToWorldMatrix, softMaterial, 0, 0, _mpb);
+                Profiler.EndSample();
             }
 
-            switch (_stencilDepth)
+            if (_shapeContainer)
             {
-                case 0: return (colors[1] / 255f);
-                case 1: return (colors[1] / 255f) * (colors[2] / 255f);
-                case 2: return (colors[1] / 255f) * (colors[2] / 255f) * (colors[3] / 255f);
-                case 3: return (colors[1] / 255f) * (colors[2] / 255f) * (colors[3] / 255f) * (colors[0] / 255f);
-                default: return 0;
+                Profiler.BeginSample("(SM4UI)[SoftMask] RenderSoftMaskBuffer > Draw shapes");
+                _shapeContainer.DrawSoftMaskBuffer(_cb, softMaskDepth);
+                Profiler.EndSample();
             }
         }
     }

@@ -8,24 +8,24 @@ namespace Coffee.UISoftMask
 {
     public static class ImportSampleMenu
     {
-        private const string jsonGuid = "c43fd233e88b347cdabc530c23ffe30a";
+        private const string k_JsonGuid = "c43fd233e88b347cdabc530c23ffe30a";
 
         [MenuItem("Assets/Samples/UISoftMask/Import Demo")]
         private static void ImportDemo()
         {
-            ImportSample(jsonGuid, "Demo");
+            ImportSample(k_JsonGuid, "Demo");
         }
 
         [MenuItem("Assets/Samples/UISoftMask/Import TextMeshPro Support")]
         private static void ImportTextMeshProSupport()
         {
-            ImportSample(jsonGuid, "TextMeshProSupport");
+            ImportSample(k_JsonGuid, "TextMeshProSupport");
         }
 
         private static void ImportSample(string jsonGuid, string sampleName)
         {
             var jsonPath = AssetDatabase.GUIDToAssetPath(jsonGuid);
-            var packageRoot = Path.GetDirectoryName(jsonPath).Replace('\\', '/');
+            var packageRoot = Path.GetDirectoryName(jsonPath)?.Replace('\\', '/');
             var json = File.ReadAllText(jsonPath);
             var version = Regex.Match(json, "\"version\"\\s*:\\s*\"([^\"]+)\"").Groups[1].Value;
             var displayName = Regex.Match(json, "\"displayName\"\\s*:\\s*\"([^\"]+)\"").Groups[1].Value;
@@ -54,7 +54,7 @@ namespace Coffee.UISoftMask
                 FileUtil.DeleteFileOrDirectory(dst);
 
             var dstDir = Path.GetDirectoryName(dst);
-            if (!Directory.Exists(dstDir))
+            if (!string.IsNullOrEmpty(dstDir) && !Directory.Exists(dstDir))
                 Directory.CreateDirectory(dstDir);
 
             if (Directory.Exists(src))

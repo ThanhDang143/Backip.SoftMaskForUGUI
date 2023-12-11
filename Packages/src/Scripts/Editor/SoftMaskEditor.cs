@@ -1,95 +1,65 @@
-using System.Collections.Generic;
+﻿using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.UI;
-using UnityEditor;
-using System.Linq;
-
 
 namespace Coffee.UISoftMask
 {
-    /// <summary>
-    /// SoftMask editor.
-    /// </summary>
-    [CustomEditor(typeof(SoftMask))]
+    [CustomEditor(typeof(SoftMask), true)]
     [CanEditMultipleObjects]
     public class SoftMaskEditor : Editor
     {
-        private const int k_PreviewSize = 128;
-        private const string k_PrefsPreview = "SoftMaskEditor_Preview";
-        private static readonly List<Graphic> s_Graphics = new List<Graphic>();
-        private static bool s_Preview;
+        private const string k_PrefsPreview = "k_PrefsPreview";
+        private const int k_PreviewSize = 220;
+        private SerializedProperty _alphaHitTest;
+        private bool _preview;
+        private SerializedProperty _showMaskGraphic;
+        private SerializedProperty _threshold;
 
-        private void OnEnable()
+        protected void OnEnable()
         {
-            s_Preview = EditorPrefs.GetBool(k_PrefsPreview, false);
+            _showMaskGraphic = serializedObject.FindProperty("m_ShowMaskGraphic");
+            _alphaHitTest = serializedObject.FindProperty("m_AlphaHitTest");
+            _threshold = serializedObject.FindProperty("m_Threshold");
+            _preview = EditorPrefs.GetBool(k_PrefsPreview, false);
         }
 
         public override void OnInspectorGUI()
         {
-            base.OnInspectorGUI();
-
             var current = target as SoftMask;
-            current.GetComponentsInChildren<Graphic>(true, s_Graphics);
-            var fixTargets = s_Graphics
-                .Where(x => x.gameObject != current.gameObject)
-                .Where(x => !x.GetComponent<SoftMaskable>() && (!x.GetComponent<Mask>() || x.GetComponent<Mask>().showMaskGraphic))
-                .ToList();
-            if (0 < fixTargets.Count)
+            if (current == null) return;
+
+            if (!current.graphic || !current.graphic.IsActive())
             {
-                GUILayout.BeginHorizontal();
-                EditorGUILayout.HelpBox("There are child Graphics that does not have a SoftMaskable component.\nAdd SoftMaskable component to them.", MessageType.Warning);
-                GUILayout.BeginVertical();
-                if (GUILayout.Button("Fix"))
-                {
-                    foreach (var p in fixTargets)
-                    {
-                        p.gameObject.AddComponent<SoftMaskable>();
-                    }
-
-                    EditorUtils.MarkPrefabDirty();
-                }
-
-                if (GUILayout.Button("Ping"))
-                {
-                    EditorGUIUtility.PingObject(fixTargets[0]);
-                }
-
-                GUILayout.EndVertical();
-                GUILayout.EndHorizontal();
+                EditorGUILayout.HelpBox("Masking disabled due to Graphic component being disabled.",
+                    MessageType.Warning);
             }
 
-            var currentImage = current.graphic as Image;
-            if (currentImage && IsMaskUI(currentImage.sprite))
+            EditorGUILayout.PropertyField(_showMaskGraphic);
+            EditorGUILayout.PropertyField(_alphaHitTest);
+            EditorGUILayout.PropertyField(_threshold);
+
+            serializedObject.ApplyModifiedProperties();
+
+            // Fix 'UIMask' issue.
+            if (current.graphic is Image currentImage && IsMaskUI(currentImage.sprite))
             {
                 GUILayout.BeginHorizontal();
-                EditorGUILayout.HelpBox("SoftMask does not recommend to use 'UIMask' sprite as a source image.\n(It contains only small alpha pixels.)\nDo you want to use 'UISprite' instead?", MessageType.Warning);
-                GUILayout.BeginVertical();
-
+                EditorGUILayout.HelpBox(
+                    "SoftMask does not recommend to use 'UIMask' sprite as a source image.\n" +
+                    "(It contains only small alpha pixels.)\n" +
+                    "Do you want to use 'UISprite' instead?",
+                    MessageType.Warning);
                 if (GUILayout.Button("Fix"))
                 {
                     currentImage.sprite = AssetDatabase.GetBuiltinExtraResource<Sprite>("UI/Skin/UISprite.psd");
                 }
 
-                GUILayout.EndVertical();
                 GUILayout.EndHorizontal();
             }
 
-            // Preview buffer.
-            GUILayout.BeginVertical(EditorStyles.helpBox);
-            if (s_Preview != (s_Preview = EditorGUILayout.ToggleLeft("Preview Soft Mask Buffer", s_Preview)))
-            {
-                EditorPrefs.SetBool(k_PrefsPreview, s_Preview);
-            }
-
-            if (s_Preview)
-            {
-                var tex = current.softMaskBuffer;
-                var width = tex.width * k_PreviewSize / tex.height;
-                EditorGUI.DrawPreviewTexture(GUILayoutUtility.GetRect(width, k_PreviewSize), tex, null, ScaleMode.ScaleToFit);
-                Repaint();
-            }
-
-            GUILayout.EndVertical();
+            // Preview soft mask buffer.
+            DrawSoftMaskBuffer();
         }
 
         private static bool IsMaskUI(Object obj)
@@ -99,30 +69,71 @@ namespace Coffee.UISoftMask
                    && AssetDatabase.GetAssetPath(obj) == "Resources/unity_builtin_extra";
         }
 
+        private void DrawSoftMaskBuffer()
+        {
+            var current = target as SoftMask;
+            if (current == null || !current.MaskEnabled()) return;
+
+            GUILayout.BeginVertical(EditorStyles.helpBox);
+            {
+                if (_preview != (_preview = EditorGUILayout.ToggleLeft("Preview Soft Mask Buffer", _preview)))
+                {
+                    EditorPrefs.SetBool(k_PrefsPreview, _preview);
+                }
+
+                if (_preview)
+                {
+                    var tex = current._softMaskBuffer;
+                    var depth = current.softMaskDepth;
+                    var colorMask = GetColorMask(depth);
+
+                    if (tex)
+                    {
+                        GUILayout.Label($"{tex.name} (Depth: {depth} {colorMask})");
+                        var aspectRatio = (float)tex.width / tex.height;
+                        EditorGUI.DrawPreviewTexture(
+                            GUILayoutUtility.GetRect(k_PreviewSize, k_PreviewSize / aspectRatio), tex, null,
+                            ScaleMode.ScaleToFit, aspectRatio, 0, colorMask);
+                    }
+                }
+            }
+            GUILayout.EndVertical();
+        }
+
+        private static ColorWriteMask GetColorMask(int depth)
+        {
+            switch (depth)
+            {
+                case 0: return ColorWriteMask.Red;
+                case 1: return ColorWriteMask.Red | ColorWriteMask.Green;
+                case 2: return ColorWriteMask.Red | ColorWriteMask.Green | ColorWriteMask.Blue;
+                default: return ColorWriteMask.All;
+            }
+        }
 
         //%%%% Context menu for editor %%%%
-        [MenuItem("CONTEXT/Mask/Convert To SoftMask", true)]
+        [MenuItem("CONTEXT/" + nameof(Mask) + "/Convert To " + nameof(SoftMask), true)]
         private static bool _ConvertToSoftMask(MenuCommand command)
         {
-            return EditorUtils.CanConvertTo<SoftMask>(command.context);
+            return command.context.CanConvertTo<SoftMask>();
         }
 
-        [MenuItem("CONTEXT/Mask/Convert To SoftMask", false)]
+        [MenuItem("CONTEXT/" + nameof(Mask) + "/Convert To " + nameof(SoftMask), false)]
         private static void ConvertToSoftMask(MenuCommand command)
         {
-            EditorUtils.ConvertTo<SoftMask>(command.context);
+            command.context.ConvertTo<SoftMask>();
         }
 
-        [MenuItem("CONTEXT/Mask/Convert To Mask", true)]
+        [MenuItem("CONTEXT/" + nameof(SoftMask) + "/Convert To " + nameof(Mask), true)]
         private static bool _ConvertToMask(MenuCommand command)
         {
-            return EditorUtils.CanConvertTo<Mask>(command.context);
+            return command.context.CanConvertTo<Mask>();
         }
 
-        [MenuItem("CONTEXT/Mask/Convert To Mask", false)]
+        [MenuItem("CONTEXT/" + nameof(SoftMask) + "/Convert To " + nameof(Mask), false)]
         private static void ConvertToMask(MenuCommand command)
         {
-            EditorUtils.ConvertTo<Mask>(command.context);
+            command.context.ConvertTo<Mask>();
         }
     }
 }
